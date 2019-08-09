@@ -19,33 +19,11 @@
  along with this program. If not, see <https://www.gnu.org/licenses/agpl.html>.
 -}
 
-module Presto.Backend.Playback.Machine where
+module Presto.Backend.Types.Options
+  (class OptionEntity
+  ) where
 
-import Prelude
+import Data.Foreign (F)
+import Data.Foreign.Class (class Encode, class Decode)
 
-import Data.Foreign.Generic (encodeJSON)
-import Presto.Backend.Runtime.Types (BackendRuntime, InterpreterMT')
-import Presto.Backend.Playback.Types (class MockedResult, class RRItem, RRItemDict(..), fromRecordingEntry, getTag, isMocked, parseRRItem, toRecordingEntry)
-import Presto.Backend.Playback.Machine.Classless (withRunModeClassless)
-
-withRunMode
-  :: forall eff rt st rrItem native
-   . RRItem rrItem
-  => MockedResult rrItem native
-  => BackendRuntime
-  -> InterpreterMT' rt st eff native
-  -> (native -> rrItem)
-  -> InterpreterMT' rt st eff native
-withRunMode brt lAct rrItemF = withRunModeClassless brt rrDict lAct
-  where
-    rrDict :: RRItemDict rrItem native
-    rrDict = RRItemDict
-        { toRecordingEntry   : toRecordingEntry
-        , fromRecordingEntry : fromRecordingEntry
-        , getTag             : getTag
-        , isMocked           : isMocked
-        , parseRRItem        : parseRRItem
-        , mkEntry            : rrItemF
-        , compare            : (==)
-        , encodeJSON         : encodeJSON
-        }
+class (Decode k, Decode v, Encode k, Encode v) <= OptionEntity k v |  k -> v

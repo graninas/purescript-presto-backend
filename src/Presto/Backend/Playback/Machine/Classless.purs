@@ -21,10 +21,10 @@
 
 module Presto.Backend.Playback.Machine.Classless where
 
-import Prelude (Unit, bind, discard, pure, show, unit, void, when, ($), (+), (<>),not,otherwise)
+import Prelude (Unit, bind, discard, pure, show, unit, void, when, ($), (+), (<$>), (<>),not,otherwise)
 
 import Control.Monad.Aff (Aff)
-import Control.Monad.Aff.AVar (AVAR, putVar, takeVar)
+import Control.Monad.Aff.AVar (AVAR, putVar, takeVar, readVar)
 import Control.Monad.Eff.Exception (error)
 import Control.Monad.Except.Trans (throwError) as E
 import Control.Monad.Reader.Trans (lift) as R
@@ -35,39 +35,46 @@ import Data.Maybe (Maybe(..), isJust, isNothing, fromMaybe)
 import Data.Tuple (Tuple(..))
 import Presto.Backend.Runtime.Common (lift3)
 import Presto.Backend.Runtime.Types (BackendRuntime(..), InterpreterMT', RunningMode(..))
-import Presto.Backend.Playback.Types (RecordingEntry(..),PlaybackError(..), PlaybackErrorType(..), PlayerRuntime, RRItemDict, RecorderRuntime, RecordingEntry,EntryReplayingMode(..),GlobalReplayingMode(..), compare', encodeJSON', fromRecordingEntry', getTag', isMocked', mkEntry', parseRRItem', toRecordingEntry')
+import Presto.Backend.Playback.Types (Recording (..), RecordingEntry(..), PlaybackError(..),
+  PlaybackErrorType(..), PlayerRuntime, RRItemDict, RecorderRuntime, RecordingEntry,
+  EntryReplayingMode(..),GlobalReplayingMode(..),
+  compare', encodeJSON', fromRecordingEntry', getTag', getInfo', mkEntry', parseRRItem', toRecordingEntry')
 import Type.Proxy (Proxy(..))
 
+showInfo :: String -> String -> String
+showInfo flowStep recordingEntry =
+  "\n    Flow step: " <> flowStep <> "\n    Recording entry: " <> recordingEntry
+
 unexpectedRecordingEnd :: String -> PlaybackError
-unexpectedRecordingEnd expected = PlaybackError
+unexpectedRecordingEnd flowStep = PlaybackError
   { errorType: UnexpectedRecordingEnd
-  , errorMessage: "Expected: " <> expected
+  , errorMessage: "\n    Flow step: " <> flowStep
   }
 
-unknownRRItem :: String -> PlaybackError
-unknownRRItem expected = PlaybackError
+unknownRRItem :: String -> String -> PlaybackError
+unknownRRItem flowStep recordingEntry = PlaybackError
   { errorType: UnknownRRItem
-  , errorMessage: "Expected: " <> expected
+  , errorMessage: showInfo flowStep recordingEntry
   }
 
-mockDecodingFailed :: String -> PlaybackError
-mockDecodingFailed expected = PlaybackError
+mockDecodingFailed :: String -> String -> PlaybackError
+mockDecodingFailed flowStep recordingEntry = PlaybackError
   { errorType: MockDecodingFailed
-  , errorMessage: "Expected: " <> expected
+  , errorMessage: showInfo flowStep recordingEntry
   }
 
 itemMismatch :: String -> String -> PlaybackError
-itemMismatch expected actual = PlaybackError
+itemMismatch flowStep recordingEntry = PlaybackError
   { errorType: ItemMismatch
-  , errorMessage: "Expected: " <> expected <> ", Actual: " <> actual
+  , errorMessage: showInfo flowStep recordingEntry
   }
 
-replayError
+setReplayingError
   :: forall eff rt st rrItem native
    . PlayerRuntime
   -> PlaybackError
   -> InterpreterMT' rt st eff native
-replayError playerRt err = do
+setReplayingError playerRt err = do
   void $ lift3 $ takeVar playerRt.errorVar
   lift3 $ putVar (Just err) playerRt.errorVar
   st <- R.lift S.get
@@ -78,108 +85,111 @@ pushRecordingEntry
    . RecorderRuntime
   -> RecordingEntry
   -> Aff (avar :: AVAR | eff) Unit
-pushRecordingEntry recorderRt entry = do
-  recording <- takeVar recorderRt.recordingVar
-  putVar { entries : Array.snoc recording.entries entry } recorderRt.recordingVar
+pushRecordingEntry recorderRt (RecordingEntry _ mode entryName encoded) = do
+  entries <- takeVar recorderRt.recordingVar
+  let re = RecordingEntry (Array.length entries) mode entryName encoded
+  putVar (Array.snoc entries re) recorderRt.recordingVar
 
 popNextRecordingEntry
   :: forall eff
    . PlayerRuntime
-  -> Aff (avar :: AVAR | eff) (Maybe RecordingEntry)
+  -> Aff (avar :: AVAR | eff) (Maybe { recordingEntry :: RecordingEntry })
 popNextRecordingEntry playerRt = do
   cur <- takeVar playerRt.stepVar
-  let mbItem = Array.index playerRt.recording.entries cur
+  let mbItem = Array.index playerRt.recording cur
   when (isJust mbItem)    $ putVar (cur + 1) playerRt.stepVar
   when (isNothing mbItem) $ putVar cur playerRt.stepVar
-  pure mbItem
+  pure $ {recordingEntry : _} <$> mbItem
 
 getCurrentEntryReplayMode
   :: forall eff
    . PlayerRuntime
-  -> Aff (avar :: AVAR | eff) (Maybe EntryReplayingMode)
+  -> Aff (avar :: AVAR | eff) EntryReplayingMode
 getCurrentEntryReplayMode playerRt = do
-  cur <- takeVar playerRt.stepVar
-  putVar cur playerRt.stepVar
-  pure $ do
-    (RecordingEntry mode item) <- Array.index playerRt.recording.entries cur
-    pure $ mode
+  cur <- readVar playerRt.stepVar
+  pure $ fromMaybe Normal $ do
+    (RecordingEntry idx mode entryName item) <- Array.index playerRt.recording cur
+    pure mode
 
 popNextRRItem
   :: forall eff rrItem native
    . PlayerRuntime
   -> RRItemDict rrItem native
-  -> Proxy rrItem
-  -> Aff (avar :: AVAR | eff) (Either PlaybackError rrItem)
-popNextRRItem playerRt rrItemDict proxy = do
+  -> Aff (avar :: AVAR | eff) (Either PlaybackError
+        { recordingEntry :: RecordingEntry
+        , rrItem :: rrItem
+        })
+popNextRRItem playerRt rrItemDict = do
   mbRecordingEntry <- popNextRecordingEntry playerRt
-  let expected = getTag' rrItemDict proxy
+  let flowStep = getTag' rrItemDict
+  let flowStepInfo = getInfo' rrItemDict
   pure $ do
     -- TODO: do not drop decoding errors
-    re <- note (unexpectedRecordingEnd expected) mbRecordingEntry
-    note (unknownRRItem expected) $ fromRecordingEntry' rrItemDict re
+    { recordingEntry } <- note (unexpectedRecordingEnd flowStepInfo) mbRecordingEntry
+    let unknownErr = unknownRRItem flowStepInfo (show recordingEntry)
+    rrItem <- note unknownErr $ fromRecordingEntry' rrItemDict recordingEntry
+    pure { recordingEntry, rrItem }
 
 popNextRRItemAndResult
   :: forall eff rrItem native
    . PlayerRuntime
   -> RRItemDict rrItem native
-  -> Proxy rrItem
-  -> Aff (avar :: AVAR | eff) (Either PlaybackError (Tuple rrItem native))
-popNextRRItemAndResult playerRt rrItemDict proxy = do
-  let expected = getTag' rrItemDict proxy
-  eNextRRItem <- popNextRRItem playerRt rrItemDict proxy
+  -> Aff (avar :: AVAR | eff) (Either PlaybackError
+        { recordingEntry :: RecordingEntry
+        , rrItem :: rrItem
+        , mockedResult :: native
+        })
+popNextRRItemAndResult playerRt rrItemDict = do
+  let flowStep = getTag' rrItemDict
+  eNextRRItem <- popNextRRItem playerRt rrItemDict
   pure $ do
-    nextRRItem <- eNextRRItem
-    let mbNative = parseRRItem' rrItemDict nextRRItem
-    nextResult <- note (mockDecodingFailed expected) mbNative
-    pure $ Tuple nextRRItem nextResult
+    { recordingEntry, rrItem } <- eNextRRItem
+    let mbNative = parseRRItem' rrItemDict rrItem
+    nextResult <- note (mockDecodingFailed flowStep (show recordingEntry)) mbNative
+    pure { recordingEntry, rrItem, mockedResult : nextResult }
 
 replayWithMock
-  :: forall eff rt st rrItem native
-   . RRItemDict rrItem native
+  :: forall eff rt st a native
+   . { recordingEntry :: RecordingEntry, rrItem :: a, mockedResult :: native }
   -> InterpreterMT' rt st eff native
-  -> Proxy rrItem
-  -> native
-  -> InterpreterMT' rt st eff native
-replayWithMock rrItemDict _ proxy nextRes
-  | isMocked' rrItemDict proxy = pure nextRes
-replayWithMock rrItemDict lAct proxy nextRes = lAct
+replayWithMock re = pure $ re.mockedResult
 
 compareRRItems
   :: forall eff rt st rrItem native
    . PlayerRuntime
   -> RRItemDict rrItem native
-  -> rrItem
+  -> { recordingEntry :: RecordingEntry, rrItem :: rrItem, mockedResult :: native }
   -> rrItem
   -> InterpreterMT' rt st eff Unit
-compareRRItems playerRt rrItemDict nextRRItem rrItem
-  | compare' rrItemDict nextRRItem rrItem = pure unit
-compareRRItems playerRt rrItemDict nextRRItem rrItem = do
-  let expected = encodeJSON' rrItemDict nextRRItem
-  let actual   = encodeJSON' rrItemDict rrItem
-  replayError playerRt $ itemMismatch expected actual
-
+compareRRItems playerRt rrItemDict { recordingEntry, rrItem, mockedResult } flowRRItem =
+  if compare' rrItemDict rrItem flowRRItem
+    then pure unit
+    else do
+      let flowStep = encodeJSON' rrItemDict flowRRItem
+      setReplayingError playerRt $ itemMismatch flowStep (show recordingEntry)
 
 replayWithGlobalConfig
-  :: forall eff rt st rrItem native. PlayerRuntime
+  :: forall eff rt st rrItem native
+   . PlayerRuntime
   -> RRItemDict rrItem native
   -> InterpreterMT' rt st eff native
-  -> Either PlaybackError (Tuple rrItem native)
+  -> Either PlaybackError { recordingEntry :: RecordingEntry, rrItem :: rrItem, mockedResult :: native }
   -> InterpreterMT' rt st eff native
 replayWithGlobalConfig playerRt rrItemDict lAct eNextRRItemRes  = do
-  let proxy = Proxy :: Proxy rrItem
-  let tag   = getTag' rrItemDict proxy
+  let tag    = getTag' rrItemDict
   let config = checkForReplayConfig playerRt tag
   case config of
-    GlobalNoVerify  -> case eNextRRItemRes of
-                        Left err -> replayError playerRt err
-                        Right (Tuple nextRRItem nextRes) -> replayWithMock rrItemDict lAct proxy nextRes
-    GlobalNoMocking -> lAct
+    GlobalNoVerify -> case eNextRRItemRes of
+        Left err -> setReplayingError playerRt err
+        Right stepInfo -> replayWithMock stepInfo
     GlobalNormal    -> case eNextRRItemRes of
-                        Left err -> replayError playerRt err
-                        Right (Tuple nextRRItem nextRes) -> do
-                          res <- replayWithMock rrItemDict lAct proxy nextRes
-                          compareRRItems playerRt rrItemDict nextRRItem $ mkEntry' rrItemDict res
-                          pure res
+        Left err -> setReplayingError playerRt err
+        Right stepInfo -> do
+          res <- replayWithMock stepInfo
+          compareRRItems playerRt rrItemDict stepInfo $ mkEntry' rrItemDict res
+          pure res
+    GlobalNoMocking -> lAct
+    GlobalSkip -> lAct -- this case can't be reachable
 
 checkForReplayConfig :: PlayerRuntime -> String -> GlobalReplayingMode
 checkForReplayConfig  playerRt tag | Array.elem tag playerRt.disableMocking  = GlobalNoMocking
@@ -191,17 +201,17 @@ replay
   -> RRItemDict rrItem native
   -> InterpreterMT' rt st eff native
   -> InterpreterMT' rt st eff native
-replay playerRt rrItemDict lAct = do
-  let proxy = Proxy :: Proxy rrItem
-  entryMode' <- lift3 $ getCurrentEntryReplayMode playerRt
-  let entryReplayMode = fromMaybe Normal entryMode'
-  eNextRRItemRes <- lift3 $ popNextRRItemAndResult playerRt rrItemDict proxy
-  case entryReplayMode of
-    Normal -> replayWithGlobalConfig playerRt rrItemDict lAct eNextRRItemRes
-    NoMock -> lAct
-    NoVerify -> case eNextRRItemRes of
-                    Left err -> replayError playerRt err
-                    Right (Tuple nextRRItem nextRes) ->  replayWithMock rrItemDict lAct proxy nextRes
+replay playerRt rrItemDict lAct
+  | (Array.elem (getTag' rrItemDict) playerRt.skipEntries ) = lAct
+  | otherwise = do
+      entryReplayMode <- lift3 $ getCurrentEntryReplayMode playerRt
+      eNextRRItemRes  <- lift3 $ popNextRRItemAndResult playerRt rrItemDict
+      case entryReplayMode of
+        Normal -> replayWithGlobalConfig playerRt rrItemDict lAct eNextRRItemRes
+        NoVerify -> case eNextRRItemRes of
+          Left err -> setReplayingError playerRt err
+          Right stepInfo -> replayWithMock stepInfo
+        NoMock -> lAct
 
 
 record
@@ -211,9 +221,22 @@ record
   -> InterpreterMT' rt st eff native
 record recorderRt rrItemDict lAct = do
   native <- lAct
-  let tag = getTag' rrItemDict (Proxy :: Proxy rrItem)
-  when ( not $ Array.elem tag recorderRt.disableEntries ) $ lift3 $ pushRecordingEntry recorderRt $ toRecordingEntry' rrItemDict (mkEntry' rrItemDict native) Normal
+  let tag = getTag' rrItemDict
+  when (not $ Array.elem tag recorderRt.disableEntries)
+    $ lift3
+    $ pushRecordingEntry recorderRt
+    $ toRecordingEntry' rrItemDict (mkEntry' rrItemDict native) 0 Normal
   pure native
+
+filterSkippingEntries playerRt
+  | playerRt.entriesFiltered = playerRt
+  | otherwise = newPlayerRt
+  where
+    newRecording = Array.filter pred playerRt.recording
+    pred (RecordingEntry _ _ entryName _) = Array.notElem entryName playerRt.skipEntries
+    newPlayerRt = playerRt { recording       = newRecording
+                           , entriesFiltered = true
+                           }
 
 withRunModeClassless
   :: forall eff rt st rrItem native
@@ -224,4 +247,4 @@ withRunModeClassless
 withRunModeClassless brt@(BackendRuntime rt) rrItemDict lAct = case rt.mode of
   RegularMode              -> lAct
   RecordingMode recorderRt -> record recorderRt rrItemDict lAct
-  ReplayingMode playerRt   -> replay playerRt   rrItemDict lAct
+  ReplayingMode playerRt   -> replay (filterSkippingEntries playerRt)   rrItemDict lAct

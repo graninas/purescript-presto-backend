@@ -25,50 +25,57 @@ import Prelude
 
 import Control.Monad.Aff.AVar (AVar)
 import Data.Maybe (Maybe)
+import Data.StrMap as StrMap
 import Data.Generic.Rep (class Generic)
 import Data.Generic.Rep.Bounded as GBounded
 import Data.Generic.Rep.Enum as GEnum
 import Data.Generic.Rep.Eq as GEq
 import Data.Generic.Rep.Ord as GOrd
 import Data.Generic.Rep.Show as GShow
-import Data.Maybe (Maybe)
 import Data.Newtype (class Newtype)
 import Data.Enum (class Enum)
 import Data.Foreign.Generic (encodeJSON)
 import Data.Foreign.Class (class Decode, class Encode)
 import Presto.Core.Utils.Encoding (defaultEncode, defaultDecode)
-import Sequelize.Models.Types (DataType(..))
-import Type.Proxy (Proxy)
+import Type.Proxy (Proxy(..))
 
-data RecordingEntry = RecordingEntry EntryReplayingMode String
-data GlobalReplayingMode = GlobalNormal | GlobalNoVerify | GlobalNoMocking
+type EntryName = String
+
+data RecordingEntry = RecordingEntry Int EntryReplayingMode EntryName String
+data GlobalReplayingMode = GlobalNormal | GlobalNoVerify | GlobalNoMocking | GlobalSkip
 data EntryReplayingMode = Normal | NoVerify | NoMock -- | Skip
 
-derive instance modeEq :: Eq EntryReplayingMode
+derive instance eqEntryReplayingMode :: Eq EntryReplayingMode
 derive instance genericEntryReplayingMode :: Generic EntryReplayingMode _
-instance entryReplayingModeEncode :: Encode EntryReplayingMode where encode = defaultEncode
-instance entryReplayingModeDecode :: Decode EntryReplayingMode where decode = defaultDecode
+instance encodeEntryReplayingMode :: Encode EntryReplayingMode where encode = defaultEncode
+instance decodeEntryReplayingMode :: Decode EntryReplayingMode where decode = defaultDecode
 instance showEntryReplayingMode :: Show EntryReplayingMode where show = GShow.genericShow
 instance ordEntryReplayingMode :: Ord EntryReplayingMode where compare = GOrd.genericCompare
 
 
-type DisableEntries  = String
--- TODO: it might be Data.Sequence.Ordered is better
-type Recording =
-  { entries :: Array RecordingEntry
-  }
+type DisableEntries = String
+
+type RecordingEntries = Array RecordingEntry
+newtype Recording = Recording RecordingEntries
 
 type RecorderRuntime =
-  { recordingVar :: AVar Recording
-   ,disableEntries :: Array DisableEntries
+  { flowGUID            :: String
+  , recordingVar        :: AVar RecordingEntries
+  , forkedRecordingsVar :: AVar (StrMap.StrMap (AVar RecordingEntries))
+  , disableEntries      :: Array DisableEntries
   }
 
 type PlayerRuntime =
-  { recording :: Recording
-  , disableVerify :: Array DisableEntries
-  , disableMocking :: Array DisableEntries
-  , stepVar   :: AVar Int
-  , errorVar  :: AVar (Maybe PlaybackError)
+  { flowGUID               :: String
+  , recording              :: RecordingEntries
+  , stepVar                :: AVar Int
+  , errorVar               :: AVar (Maybe PlaybackError)
+  , forkedFlowRecordings   :: StrMap.StrMap RecordingEntries
+  , forkedFlowErrorsVar    :: AVar (StrMap.StrMap PlaybackError)
+  , disableVerify          :: Array DisableEntries
+  , disableMocking         :: Array DisableEntries
+  , skipEntries            :: Array DisableEntries
+  , entriesFiltered        :: Boolean
   }
 
 data PlaybackErrorType
@@ -76,6 +83,8 @@ data PlaybackErrorType
   | UnknownRRItem
   | MockDecodingFailed
   | ItemMismatch
+  | UnknownPlaybackError
+  | ForkedFlowRecordingsMissed
 
 newtype PlaybackError = PlaybackError
   { errorType :: PlaybackErrorType
@@ -84,16 +93,23 @@ newtype PlaybackError = PlaybackError
 
 
 class (Eq rrItem, Decode rrItem, Encode rrItem) <= RRItem rrItem where
-  toRecordingEntry   :: rrItem -> EntryReplayingMode -> RecordingEntry
+  toRecordingEntry   :: rrItem -> Int -> EntryReplayingMode -> RecordingEntry
   fromRecordingEntry :: RecordingEntry -> Maybe rrItem
   getTag             :: Proxy rrItem -> String
-  isMocked           :: Proxy rrItem -> Boolean
 
 -- Class for conversions of RRItem and native results.
 -- Native result can be unencodable completely.
 -- TODO: error handling
 class (RRItem rrItem) <= MockedResult rrItem native | rrItem -> native where
   parseRRItem :: rrItem -> Maybe native
+
+
+derive instance eqRecording :: Eq Recording
+derive instance genericRecording :: Generic Recording _
+instance encodeRecording :: Encode Recording where encode = defaultEncode
+instance decodeRecording :: Decode Recording where decode = defaultDecode
+instance showRecording :: Show Recording where show = GShow.genericShow
+instance ordRecording :: Ord Recording where compare = GOrd.genericCompare
 
 derive instance genericRecordingEntry :: Generic RecordingEntry _
 instance decodeRecordingEntry         :: Decode  RecordingEntry where decode = defaultDecode
@@ -125,10 +141,10 @@ instance ordPlaybackError            :: Ord     PlaybackError where compare = GO
 
 -- Classless types
 newtype RRItemDict rrItem native = RRItemDict
-  { toRecordingEntry   :: rrItem -> EntryReplayingMode -> RecordingEntry
+  { toRecordingEntry   :: rrItem -> Int -> EntryReplayingMode -> RecordingEntry
   , fromRecordingEntry :: RecordingEntry -> Maybe rrItem
-  , getTag             :: Proxy rrItem -> String
-  , isMocked           :: Proxy rrItem -> Boolean
+  , getInfo            :: String
+  , getTag             :: String
   , parseRRItem        :: rrItem -> Maybe native
   , mkEntry            :: native -> rrItem
   , compare            :: rrItem -> rrItem -> Boolean
@@ -137,17 +153,23 @@ newtype RRItemDict rrItem native = RRItemDict
 
 
 
-toRecordingEntry' :: forall rrItem native. RRItemDict rrItem native -> rrItem -> EntryReplayingMode -> RecordingEntry
-toRecordingEntry' (RRItemDict d) mode = d.toRecordingEntry mode
+toRecordingEntry'
+  :: forall rrItem native
+   . RRItemDict rrItem native
+  -> rrItem
+  -> Int
+  -> EntryReplayingMode
+  -> RecordingEntry
+toRecordingEntry' (RRItemDict d) = d.toRecordingEntry
 
 fromRecordingEntry' :: forall rrItem native. RRItemDict rrItem native -> RecordingEntry -> Maybe rrItem
 fromRecordingEntry' (RRItemDict d) = d.fromRecordingEntry
 
-getTag' :: forall rrItem native. RRItemDict rrItem native -> Proxy rrItem -> String
-getTag' (RRItemDict d) = d.getTag
+getInfo' :: forall rrItem native. RRItemDict rrItem native -> String
+getInfo' (RRItemDict d) = d.getInfo
 
-isMocked' :: forall rrItem native. RRItemDict rrItem native -> Proxy rrItem -> Boolean
-isMocked' (RRItemDict d) = d.isMocked
+getTag' :: forall rrItem native. RRItemDict rrItem native -> String
+getTag' (RRItemDict d) = d.getTag
 
 parseRRItem' :: forall rrItem native. RRItemDict rrItem native -> rrItem -> Maybe native
 parseRRItem' (RRItemDict d) = d.parseRRItem
@@ -162,12 +184,18 @@ encodeJSON' :: forall rrItem native. RRItemDict rrItem native -> rrItem -> Strin
 encodeJSON' (RRItemDict d) = d.encodeJSON
 
 
-mkEntryDict :: forall rrItem native. RRItem rrItem => MockedResult rrItem native => (native -> rrItem) -> RRItemDict rrItem native
-mkEntryDict mkEntry = RRItemDict
+mkEntryDict
+  :: forall rrItem native
+   . RRItem rrItem
+  => MockedResult rrItem native
+  => String
+  -> (native -> rrItem)
+  -> RRItemDict rrItem native
+mkEntryDict mkInfo mkEntry = RRItemDict
   { toRecordingEntry   : toRecordingEntry
   , fromRecordingEntry : fromRecordingEntry
-  , getTag             : getTag
-  , isMocked           : isMocked
+  , getInfo            : mkInfo
+  , getTag             : getTag (Proxy :: Proxy rrItem)
   , parseRRItem        : parseRRItem
   , mkEntry            : mkEntry
   , compare            : (==)

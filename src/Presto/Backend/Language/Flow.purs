@@ -27,11 +27,15 @@ import Cache.Types (EntryID(..), Item(..))
 import Control.Monad.Aff (Aff)
 import Control.Monad.Eff (Eff)
 import Control.Monad.Eff.Exception (Error)
+import Control.Monad.Except (runExcept)
 import Control.Monad.Free (Free, liftF)
-import Data.Either (Either)
+import Control.Monad (when, unless)
+import Data.Either (Either(..))
+import Data.String (null)
 import Data.Exists (Exists, mkExists)
 import Data.Foreign (Foreign, toForeign)
 import Data.Foreign.Class (class Decode, class Encode, encode)
+import Data.Foreign.Generic (encodeJSON, decodeJSON)
 import Data.Maybe (Maybe(Just, Nothing))
 import Data.Newtype (class Newtype)
 import Data.Options (Options)
@@ -45,13 +49,15 @@ import Presto.Backend.KVDB.Mock.Types as KVDBMock
 import Presto.Backend.Language.KVDB (KVDB, delCache, delCacheInMulti, dequeue, dequeueInMulti, enqueue, enqueueInMulti, execMulti, expire, expireInMulti, getCache, getCacheInMulti, getHashKey, getHashKeyInMulti, getQueueIdx, getQueueIdxInMulti, incr, incrInMulti, keyExistsCache, newMulti, publishToChannel, publishToChannelInMulti, setCache, setCacheInMulti, setHash, setHashInMulti, setMessageHandler, subscribe, subscribeToMulti, addInMulti) as KVDB
 import Presto.Backend.Language.Types.DB (DBError, KVDBConn, MockedKVDBConn, MockedSqlConn, SqlConn, fromDBMaybeResult, toDBMaybeResult)
 import Presto.Backend.Language.Types.EitherEx (EitherEx, fromCustomEitherEx, fromCustomEitherExF, toCustomEitherEx, toCustomEitherExF)
+import Presto.Backend.Language.Types.MaybeEx (MaybeEx)
 import Presto.Backend.Language.Types.KVDB (Multi)
 import Presto.Backend.Language.Types.KVDB (getKVDBName) as KVDB
 import Presto.Backend.Language.Types.UnitEx (UnitEx, fromUnitEx, toUnitEx)
-import Presto.Backend.Playback.Entries (CallAPIEntry, DoAffEntry, ForkFlowEntry, GetDBConnEntry, GetKVDBConnEntry, LogEntry, RunDBEntry, RunKVDBEitherEntry, RunKVDBSimpleEntry, RunSysCmdEntry, mkCallAPIEntry, mkDoAffEntry, mkForkFlowEntry, mkGetDBConnEntry, mkGetKVDBConnEntry, mkLogEntry, mkRunDBEntry, mkRunKVDBEitherEntry, mkRunKVDBSimpleEntry, mkRunSysCmdEntry) as Playback
+import Presto.Backend.Playback.Entries (CallAPIEntry, GenerateGUIDEntry, DoAffEntry, ForkFlowEntry, GetDBConnEntry, GetKVDBConnEntry, LogEntry, GetOptionEntry, RunDBEntry, RunKVDBEitherEntry, RunKVDBSimpleEntry, RunSysCmdEntry, SetOptionEntry, mkCallAPIEntry, mkDoAffEntry, mkForkFlowEntry, mkGetDBConnEntry, mkGetKVDBConnEntry, mkLogEntry, mkGetOptionEntry, mkRunDBEntry, mkRunKVDBEitherEntry, mkRunKVDBSimpleEntry, mkRunSysCmdEntry, mkGenerateGUIDEntry, mkSetOptionEntry) as Playback
 import Presto.Backend.Playback.Types (RRItemDict, mkEntryDict) as Playback
 import Presto.Backend.Types (BackendAff)
 import Presto.Backend.Types.API (class RestEndpoint, Headers, ErrorResponse, APIResult, makeRequest)
+import Presto.Backend.Types.Options (class OptionEntity)
 import Presto.Backend.Runtime.Common (jsonStringify)
 import Presto.Core.Types.Language.Interaction (Interaction)
 import Sequelize.Class (class Model)
@@ -62,6 +68,10 @@ data BackendFlowCommands next st rt s
     | Get (st -> next)
     | Put st (st -> next)
     | Modify (st -> st) (st -> next)
+
+    | GenerateGUID
+        (Playback.RRItemDict Playback.GenerateGUIDEntry String)
+        (String -> next)
 
     | CallAPI (Interaction (EitherEx ErrorResponse s))
         (Playback.RRItemDict Playback.CallAPIEntry (EitherEx ErrorResponse s))
@@ -78,6 +88,7 @@ data BackendFlowCommands next st rt s
         (UnitEx -> next)
 
     | Fork (BackendFlow st rt s)
+        String
         (Playback.RRItemDict Playback.ForkFlowEntry UnitEx)
         (UnitEx -> next)
 
@@ -113,6 +124,14 @@ data BackendFlowCommands next st rt s
         (Playback.RRItemDict Playback.RunKVDBSimpleEntry s)
         (s -> next)
 
+    | GetOption  String
+        (Playback.RRItemDict Playback.GetOptionEntry (MaybeEx String))
+        (Maybe String -> next)
+
+    | SetOption String String
+        (Playback.RRItemDict Playback.SetOptionEntry UnitEx)
+        (UnitEx -> next)
+
 type BackendFlowCommandsWrapper st rt s next = BackendFlowCommands next st rt s
 
 newtype BackendFlowWrapper st rt next = BackendFlowWrapper (Exists (BackendFlowCommands next st rt))
@@ -134,6 +153,56 @@ put st = wrap $ Put st id
 modify :: forall st rt. (st -> st) -> BackendFlow st rt st
 modify fst = wrap $ Modify fst id
 
+setOption' :: forall st rt. String -> String -> BackendFlow st rt Unit
+setOption' key val = void $ wrap $
+  SetOption key val
+    (Playback.mkEntryDict
+      ("setOption key: " <> key <> " value: " <> val)
+      $ Playback.mkSetOptionEntry key val)
+    id
+
+setOption
+  :: forall k v st rt
+   . OptionEntity k v
+   => Encode k
+   => Encode v
+   => k -> v -> BackendFlow st rt Unit
+setOption k v = do
+  let rawKey = encodeJSON k
+  let rawVal = encodeJSON v
+  setOption' rawKey rawVal
+
+getOption' :: forall st rt. String -> BackendFlow st rt (Maybe String)
+getOption' key = wrap $
+  GetOption key
+    (Playback.mkEntryDict
+      ("getOption key: " <> key)
+      $ Playback.mkGetOptionEntry key)
+    id
+
+getOption
+  :: forall k v st rt
+   . OptionEntity k v
+   => Encode k
+   => Decode v
+   => k -> BackendFlow st rt (Maybe v)
+getOption k = do
+  let rawKey = encodeJSON k
+  eRawVal <- getOption' rawKey
+  case eRawVal of
+    Nothing -> pure Nothing
+    Just rawV -> case (runExcept $ decodeJSON rawV) of
+      Left err -> pure Nothing
+      Right val -> pure $ Just val
+
+generateGUID' :: forall st rt. String -> BackendFlow st rt String
+generateGUID' description = wrap $ GenerateGUID
+    (Playback.mkEntryDict description $ Playback.mkGenerateGUIDEntry description)
+    id
+
+generateGUID :: forall st rt. BackendFlow st rt String
+generateGUID = generateGUID' ""
+
 callAPI
   :: forall st rt a b
    . Encode a
@@ -143,11 +212,22 @@ callAPI
   => Headers -> a -> BackendFlow st rt (APIResult b)
 callAPI headers a = wrap $ CallAPI
   (apiInteract a headers)
-  (Playback.mkEntryDict (Playback.mkCallAPIEntry (\_ -> encode $ makeRequest a headers)))
+  (Playback.mkEntryDict
+    (encodeJSON $ makeRequest a headers)
+    (Playback.mkCallAPIEntry (\_ -> encode $ makeRequest a headers)))
   id
 
 doAff :: forall st rt a. (forall eff. BackendAff eff a) -> BackendFlow st rt a
 doAff aff = wrap $ DoAff aff id
+
+doAffRR'
+  :: forall st rt a
+   . Encode a
+  => Decode a
+  => String
+  -> (forall eff. BackendAff eff a)
+  -> BackendFlow st rt a
+doAffRR' description aff = wrap $ DoAffRR aff (Playback.mkEntryDict ("doAffRR' " <> description) $ Playback.mkDoAffEntry description) id
 
 doAffRR
   :: forall st rt a
@@ -155,19 +235,26 @@ doAffRR
   => Decode a
   => (forall eff. BackendAff eff a)
   -> BackendFlow st rt a
-doAffRR aff = wrap $ DoAffRR aff (Playback.mkEntryDict Playback.mkDoAffEntry) id
+doAffRR = doAffRR' ""
 
 -- TODO: this is not a correct solution, jsonStringify is a strange function
 -- that feels hacky.
 log :: forall st rt a. String -> a -> BackendFlow st rt Unit
 log tag message = void $ wrap $ Log tag message
-    (Playback.mkEntryDict $ Playback.mkLogEntry tag $ jsonStringify message)
+    (Playback.mkEntryDict
+      ("tag: " <> tag <> ", message: " <> jsonStringify message)
+      $ Playback.mkLogEntry tag $ jsonStringify message)
     id
 
 forkFlow' :: forall st rt a. String -> BackendFlow st rt a -> BackendFlow st rt Unit
-forkFlow' description flow =
-  void $ wrap $ Fork flow
-    (Playback.mkEntryDict $ Playback.mkForkFlowEntry description)
+forkFlow' description flow = do
+  flowGUID <- generateGUID' description
+  unless (null description) $ log "forkFlow" $ "Flow forked. Description: " <> description <> " GUID: " <> flowGUID
+  when   (null description) $ log "forkFlow" $ "Flow forked. GUID: " <> flowGUID
+  void $ wrap $ Fork flow flowGUID
+    (Playback.mkEntryDict
+      ("description: " <> description <> " GUID: " <> flowGUID)
+      $ Playback.mkForkFlowEntry description flowGUID)
     id
 
 forkFlow :: forall st rt a. BackendFlow st rt a -> BackendFlow st rt Unit
@@ -176,7 +263,9 @@ forkFlow = forkFlow' ""
 runSysCmd :: forall st rt. String -> BackendFlow st rt String
 runSysCmd cmd =
   wrap $ RunSysCmd cmd
-    (Playback.mkEntryDict $ Playback.mkRunSysCmdEntry cmd)
+    (Playback.mkEntryDict
+      ("cmd: " <> cmd)
+      $ Playback.mkRunSysCmdEntry cmd)
     id
 
 throwException :: forall st rt a. String -> BackendFlow st rt a
@@ -184,7 +273,9 @@ throwException errorMessage = wrap $ ThrowException errorMessage
 
 getDBConn :: forall st rt. String -> BackendFlow st rt SqlConn
 getDBConn dbName = wrap $ GetDBConn dbName
-  (Playback.mkEntryDict $ Playback.mkGetDBConnEntry dbName)
+  (Playback.mkEntryDict
+    ("dbName: " <> dbName <> ", getDBConn")
+    $ Playback.mkGetDBConnEntry dbName)
   id
 
 findOne
@@ -195,7 +286,9 @@ findOne dbName options = do
   eResEx <- wrap $ RunDB dbName
     (\conn     -> toDBMaybeResult <$> DB.findOne conn options)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkFindOne dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "findOne" [Opt.options options] (encode ""))
+    (Playback.mkEntryDict
+      (dbName <> ", query: findOne, opts: " <> encodeJSON (Opt.options options) )
+      $ Playback.mkRunDBEntry dbName "findOne" [Opt.options options] (encode ""))
     id
   pure $ fromDBMaybeResult eResEx
 
@@ -207,7 +300,9 @@ findAll dbName options = do
   eResEx <- wrap $ RunDB dbName
     (\conn -> toCustomEitherEx <$> DB.findAll conn options)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkFindAll dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "findAll" [Opt.options options] (encode ""))
+    (Playback.mkEntryDict
+      (dbName <> ", query: findAll, opts: " <> encodeJSON (Opt.options options) )
+      $ Playback.mkRunDBEntry dbName "findAll" [Opt.options options] (encode ""))
     id
   pure $ fromCustomEitherEx eResEx
 
@@ -221,7 +316,9 @@ query dbName rawq = do
   eResEx <- wrap $ RunDB dbName
     (\conn -> toCustomEitherEx <$> DB.query conn rawq)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkQuery dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "query" [toForeign rawq] (encode ""))
+    (Playback.mkEntryDict
+        (dbName <> ", rawq: " <> rawq)
+        $ Playback.mkRunDBEntry dbName "query" [toForeign rawq] (encode ""))
     id
   pure $ fromCustomEitherEx eResEx
 
@@ -230,7 +327,9 @@ create dbName model = do
   eResEx <- wrap $ RunDB dbName
     (\conn -> toDBMaybeResult <$> DB.create conn model)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkCreate dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "create" [] (encode model))
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", create " <> encodeJSON model)
+      $ Playback.mkRunDBEntry dbName "create" [] (encode model))
     id
   pure $ fromDBMaybeResult eResEx
 
@@ -239,7 +338,9 @@ createWithOpts dbName model options = do
   eResEx <- wrap $ RunDB dbName
     (\conn -> toDBMaybeResult <$> DB.createWithOpts conn model options)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkCreateWithOpts dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "createWithOpts" [Opt.options options] (encode model))
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", createWithOpts " <> encodeJSON model <> ", opts: " <> encodeJSON (Opt.options options))
+      $ Playback.mkRunDBEntry dbName "createWithOpts" [Opt.options options] (encode model))
     id
   pure $ fromDBMaybeResult eResEx
 
@@ -248,7 +349,9 @@ update dbName updateValues whereClause = do
   eResEx <- wrap $ RunDB dbName
     (\conn -> toCustomEitherEx <$> DB.update conn updateValues whereClause)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkUpdate dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "update" [(Opt.options updateValues),(Opt.options whereClause)] (encode ""))
+    (Playback.mkEntryDict
+      (dbName <> ", update, updVals: " <> encodeJSON [(Opt.options updateValues),(Opt.options whereClause)])
+      $ Playback.mkRunDBEntry dbName "update" [(Opt.options updateValues),(Opt.options whereClause)] (encode ""))
     id
   pure $ fromCustomEitherEx eResEx
 
@@ -257,7 +360,9 @@ update' dbName updateValues whereClause = do
   eResEx <- wrap $ RunDB dbName
     (\conn -> toCustomEitherEx <$> DB.update' conn updateValues whereClause)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkUpdate dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "update'" [(Opt.options updateValues),(Opt.options whereClause)] (encode ""))
+    (Playback.mkEntryDict
+      (dbName <> ", update', updVals: " <> encodeJSON [(Opt.options updateValues),(Opt.options whereClause)] )
+      $ Playback.mkRunDBEntry dbName "update'" [(Opt.options updateValues),(Opt.options whereClause)] (encode ""))
     id
   pure $ fromCustomEitherEx eResEx
 
@@ -266,13 +371,17 @@ delete dbName options = do
   eResEx <- wrap $ RunDB dbName
     (\conn -> toCustomEitherEx <$> DB.delete conn options)
     (\connMock -> SqlDBMock.mkDbActionDict $ SqlDBMock.mkDelete dbName)
-    (Playback.mkEntryDict $ Playback.mkRunDBEntry dbName "delete" [Opt.options options] (encode ""))
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", delete, opts: " <> encodeJSON (Opt.options options))
+      $ Playback.mkRunDBEntry dbName "delete" [Opt.options options] (encode ""))
     id
   pure $ fromCustomEitherEx eResEx
 
 getKVDBConn :: forall st rt. String -> BackendFlow st rt KVDBConn
 getKVDBConn dbName = wrap $ GetKVDBConn dbName
-  (Playback.mkEntryDict $ Playback.mkGetKVDBConnEntry dbName)
+  (Playback.mkEntryDict
+    ("dbName: " <> dbName <> ", getKVDBConn")
+    $ Playback.mkGetKVDBConnEntry dbName)
   id
 
 -- Not sure about this method.
@@ -282,7 +391,9 @@ setCache dbName key value = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherExF toUnitEx <$> KVDB.setCache key value Nothing)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "setCache" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", setCache, key: " <> key <> ", value: " <> value)
+        $ Playback.mkRunKVDBEitherEntry dbName "setCache" ("key: " <> key <> ", value: " <> value))
       id
   pure $ fromCustomEitherExF fromUnitEx eRes
 
@@ -293,7 +404,9 @@ setCacheWithExpiry dbName key value ttl = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherExF toUnitEx <$> KVDB.setCache key value (Just ttl))
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "setCacheWithExpiry" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", setCacheWithExpiry, key: " <> key <> ", value: " <> value <> ", ttl: " <> show ttl)
+        $ Playback.mkRunKVDBEitherEntry dbName "setCacheWithExpiry" ("key: " <> key <> ", value: " <> value <> ", ttl: " <> show ttl))
       id
   pure $ fromCustomEitherExF fromUnitEx eRes
 
@@ -302,7 +415,9 @@ getCache dbName key = do
   eRes <- wrap $ RunKVDBEither dbName
       (toDBMaybeResult <$> KVDB.getCache key)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "getCache" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", getCache, key: " <> key)
+        $ Playback.mkRunKVDBEitherEntry dbName "getCache" ("key: " <> key))
       id
   pure $ fromDBMaybeResult eRes
 
@@ -311,7 +426,9 @@ keyExistsCache dbName key = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.keyExistsCache key)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "keyExistsCache" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", keyExistsCache, key: " <> key)
+        $ Playback.mkRunKVDBEitherEntry dbName "keyExistsCache" ("key: " <> key))
       id
   pure $ fromCustomEitherEx eRes
 
@@ -320,7 +437,9 @@ delCache dbName key = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.delCache key)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "delCache" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", delCache, key: " <> key)
+        $ Playback.mkRunKVDBEitherEntry dbName "delCache" ("key: " <> key))
       id
   pure $ fromCustomEitherEx eRes
 
@@ -329,7 +448,9 @@ expire dbName key ttl = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.expire key ttl)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "expire" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", delCache, key: " <> key <> ", ttl: " <> show ttl)
+        $ Playback.mkRunKVDBEitherEntry dbName "expire" ("key: " <> key <> ", ttl: " <> show ttl))
       id
   pure $ fromCustomEitherEx eRes
 
@@ -338,7 +459,9 @@ incr dbName key = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.incr key)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "incr" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", incr, key: " <> key)
+        $ Playback.mkRunKVDBEitherEntry dbName "incr" ("key: " <> key))
       id
   pure $ fromCustomEitherEx eRes
 
@@ -347,7 +470,9 @@ setHash dbName key field value = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.setHash key field value)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "setHash" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", setHash, key: " <> key <> ", field: " <> field <> ", value: " <> value)
+        $ Playback.mkRunKVDBEitherEntry dbName "setHash" ("key: " <> key <> ", field: " <> field <> ", value: " <> value))
       id
   pure $ fromCustomEitherEx eRes
 
@@ -356,7 +481,9 @@ getHashKey dbName key field = do
   eRes <- wrap $ RunKVDBEither dbName
       (toDBMaybeResult <$> KVDB.getHashKey key field)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "getHashKey" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", getHashKey, key: " <> key <> ", field: " <> field)
+        $ Playback.mkRunKVDBEitherEntry dbName "getHashKey" ("key: " <> key <> ", field: " <> field))
       id
   pure $ fromDBMaybeResult eRes
 
@@ -365,7 +492,9 @@ publishToChannel dbName channel message = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.publishToChannel channel message)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "publishToChannel" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", publishToChannel, channel: " <> channel <> ", message: " <> message)
+        $ Playback.mkRunKVDBEitherEntry dbName "publishToChannel" ("channel: " <> channel <> ", message: " <> message))
       id
   pure $ fromCustomEitherEx eRes
 
@@ -376,7 +505,9 @@ subscribe dbName channel = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherExF toUnitEx <$> KVDB.subscribe channel)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "subscribe" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", subscribe, channel: " <> channel)
+        $ Playback.mkRunKVDBEitherEntry dbName "subscribe" ("channel: " <> channel))
       id
   pure $ fromCustomEitherExF fromUnitEx eRes
 
@@ -387,7 +518,9 @@ enqueue dbName listName value = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherExF toUnitEx <$> KVDB.enqueue listName value)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "enqueue" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", enqueue, listName: " <> listName <> ", value: " <> value)
+        $ Playback.mkRunKVDBEitherEntry dbName "enqueue" ("listName: " <> listName <> ", value: " <> value))
       id
   pure $ fromCustomEitherExF fromUnitEx eRes
 
@@ -396,7 +529,9 @@ dequeue dbName listName = do
   eRes <- wrap $ RunKVDBEither dbName
       (toDBMaybeResult <$> KVDB.dequeue listName)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "dequeue" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", dequeue, listName: " <> listName)
+        $ Playback.mkRunKVDBEitherEntry dbName "dequeue" ("listName: " <> listName))
       id
   pure $ fromDBMaybeResult eRes
 
@@ -405,7 +540,9 @@ getQueueIdx dbName listName index = do
   eRes <- wrap $ RunKVDBEither dbName
       (toDBMaybeResult <$> KVDB.getQueueIdx listName index)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "getQueueIdx" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", getQueueIdx, listName: " <> listName <> ", idx: " <> show index)
+        $ Playback.mkRunKVDBEitherEntry dbName "getQueueIdx" ("listName: " <> listName <> ", idx: " <> show index))
       id
   pure $ fromDBMaybeResult eRes
 
@@ -416,7 +553,9 @@ newMulti dbName =
   wrap $ RunKVDBSimple dbName
     KVDB.newMulti
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "newMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", newMulti")
+      $ Playback.mkRunKVDBSimpleEntry dbName "newMulti" "")
     id
 
 setCacheInMulti :: forall st rt. String -> String -> Multi -> BackendFlow st rt Multi
@@ -425,7 +564,9 @@ setCacheInMulti key value multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.setCacheInMulti key value Nothing multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "setCacheInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", setCacheInMulti, key: " <> key <> ", value: " <> value <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "setCacheInMulti" ("key: " <> key <> ", value: " <> value <> ", multi: " <> show multi))
     id
 
 -- Why this function returns Multi???
@@ -435,7 +576,9 @@ getCacheInMulti key multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.getCacheInMulti key multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "getCacheInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", getCacheInMulti, key: " <> key <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "getCacheInMulti" ("key: " <> key <> ", multi: " <> show multi))
     id
 
 delCacheInMulti :: forall st rt. String -> Multi -> BackendFlow st rt Multi
@@ -444,7 +587,9 @@ delCacheInMulti key multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.delCacheInMulti key multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "delCacheInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", delCacheInMulti, key: " <> key)
+      $ Playback.mkRunKVDBSimpleEntry dbName "delCacheInMulti" ("key: " <> key))
     id
 
 setCacheWithExpireInMulti :: forall st rt. String -> String -> Milliseconds -> Multi -> BackendFlow st rt Multi
@@ -453,7 +598,9 @@ setCacheWithExpireInMulti key value ttl multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.setCacheInMulti key value (Just ttl) multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "setCacheWithExpireInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", setCacheWithExpireInMulti, key: " <> key <> ", value: " <> value <> ", ttl: " <> show ttl <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "setCacheWithExpireInMulti" ("key: " <> key <> ", value: " <> value <> ", ttl: " <> show ttl <> ", multi: " <> show multi))
     id
 
 expireInMulti :: forall st rt. String -> Seconds -> Multi -> BackendFlow st rt Multi
@@ -462,7 +609,9 @@ expireInMulti key ttl multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.expireInMulti key ttl multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "expireInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", expireInMulti, key: " <> key <> ", ttl: " <> show ttl <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "expireInMulti" ("key: " <> key <> ", ttl: " <> show ttl <> ", multi: " <> show multi))
     id
 
 incrInMulti :: forall st rt. String -> Multi -> BackendFlow st rt Multi
@@ -471,7 +620,9 @@ incrInMulti key multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.incrInMulti key multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "incrInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", incrInMulti, key: " <> key <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "incrInMulti" ("key: " <> key <> ", multi: " <> show multi))
     id
 
 setHashInMulti :: forall st rt. String -> String -> String -> Multi -> BackendFlow st rt Multi
@@ -480,7 +631,9 @@ setHashInMulti key field value multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.setHashInMulti key field value multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "setHashInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", setHashInMulti, key: " <> key <> ", field: " <> field <> ", value: " <> value <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "setHashInMulti" ("key: " <> key <> ", field: " <> field <> ", value: " <> value <> ", multi: " <> show multi))
     id
 
 -- Why this function returns Multi???
@@ -490,7 +643,9 @@ getHashKeyInMulti key field multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.getHashKeyInMulti key field multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "getHashKeyInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", getHashKeyInMulti, key: " <> key <> ", field: " <> field <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "getHashKeyInMulti" ("key: " <> key <> ", field: " <> field <> ", multi: " <> show multi))
     id
 
 publishToChannelInMulti :: forall st rt. String -> String -> Multi -> BackendFlow st rt Multi
@@ -499,7 +654,9 @@ publishToChannelInMulti channel message multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.publishToChannelInMulti channel message multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "publishToChannelInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", publishToChannelInMulti, channel: " <> channel <> ", message: " <> message <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "publishToChannelInMulti" ("channel: " <> channel <> ", message: " <> message <> ", multi: " <> show multi))
     id
 
 enqueueInMulti :: forall st rt. String -> String -> Multi -> BackendFlow st rt Multi
@@ -508,7 +665,9 @@ enqueueInMulti listName value multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.enqueueInMulti listName value multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "enqueueInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", enqueueInMulti, value: " <> value <> ", listName: " <> listName <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "enqueueInMulti" ("value: " <> value <> ", listName: " <> listName <> ", multi: " <> show multi))
     id
 
 -- Why this function returns Multi???
@@ -518,7 +677,9 @@ dequeueInMulti listName multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.dequeueInMulti listName multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "dequeueInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", dequeueInMulti, listName: " <> listName <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "dequeueInMulti" ("listName: " <> listName <> ", multi: " <> show multi))
     id
 
 -- Why this function returns Multi???
@@ -528,7 +689,9 @@ getQueueIdxInMulti listName index multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.getQueueIdxInMulti listName index multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "getQueueIdxInMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", getQueueIdxInMulti, listName: " <> listName <> ", index: " <> show index <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "getQueueIdxInMulti" ("listName: " <> listName <> ", index: " <> show index <> ", multi: " <> show multi))
     id
 
 subscribeToMulti :: forall st rt. String -> Multi -> BackendFlow st rt Multi
@@ -537,7 +700,9 @@ subscribeToMulti channel multi = let
   in wrap $ RunKVDBSimple dbName
     (KVDB.subscribeToMulti channel multi)
     KVDBMock.mkKVDBActionDict
-    (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "subscribeToMulti" "")
+    (Playback.mkEntryDict
+      ("dbName: " <> dbName <> ", subscribeToMulti, channel: " <> channel <> ", multi: " <> show multi)
+      $ Playback.mkRunKVDBSimpleEntry dbName "subscribeToMulti" ("channel: " <> channel <> ", multi: " <> show multi))
     id
 
 execMulti :: forall st rt. Multi -> BackendFlow st rt (Either Error (Array Foreign))
@@ -546,17 +711,21 @@ execMulti multi = do
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.execMulti multi)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "execMulti" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", execMulti, multi: " <> show multi)
+        $ Playback.mkRunKVDBEitherEntry dbName "execMulti" ("multi: " <> show multi))
       id
   pure $ fromCustomEitherEx eRes
 
-addInMulti :: forall st rt.String -> EntryID -> (Array Item) -> Multi -> BackendFlow st rt (Either Error Multi)
+addInMulti :: forall st rt. String -> EntryID -> (Array Item) -> Multi -> BackendFlow st rt (Either Error Multi)
 addInMulti key entryId args multi = do
   let dbName = KVDB.getKVDBName multi
   eRes <- wrap $ RunKVDBEither dbName
       (toCustomEitherEx <$> KVDB.addInMulti key entryId args multi)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBEitherEntry dbName "addInMulti" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", addInMulti, key: " <> key <> ", entryId: " <> show entryId <> ", multi: " <> show multi)
+        $ Playback.mkRunKVDBEitherEntry dbName "addInMulti" ("key: " <> key <> ", entryId: " <> show entryId <> ", multi: " <> show multi))
       id
   pure $ fromCustomEitherEx eRes
 
@@ -569,5 +738,7 @@ setMessageHandler dbName f = do
   void $ wrap $ RunKVDBSimple dbName
       (toUnitEx <$> KVDB.setMessageHandler f)
       KVDBMock.mkKVDBActionDict
-      (Playback.mkEntryDict $ Playback.mkRunKVDBSimpleEntry dbName "setMessageHandler" "")
+      (Playback.mkEntryDict
+        ("dbName: " <> dbName <> ", setMessageHandler")
+        $ Playback.mkRunKVDBSimpleEntry dbName "setMessageHandler" "")
       id
